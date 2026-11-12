@@ -18,6 +18,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import secrets
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -30,6 +31,7 @@ from homeassistant.helpers.event import async_call_later, async_track_state_chan
 from homeassistant.helpers.storage import Store
 
 from .const import (
+    EVENT_BONUS_CODE_REDEEMED,
     EVENT_COMPLETION_UNDONE,
     EVENT_POINTS_DEDUCTED,
     EVENT_REWARD_REDEMPTION_APPROVED,
@@ -152,6 +154,10 @@ class AufgabenScoreboardManager:
                     # der letzten Zeitplan-Anlage - verhindert eine zweite
                     # Anlage am selben Tag, selbst wenn die zuvor erzeugte
                     # Aufgabe zwischenzeitlich bereits erledigt wurde
+                "schedule_last_completed": "2026-01-01" oder None,  # Datum
+                    # der letzten FREIGEGEBENEN Erledigung einer aus dieser
+                    # Vorlage erzeugten Aufgabe - bei "days" zählt das
+                    # Intervall ab diesem Datum (statt ab schedule_anchor)
                 "created_at": "...",
             },
             ...
@@ -166,6 +172,18 @@ class AufgabenScoreboardManager:
                 # Siegerehrung um den jeweiligen Punktestand erhöht und bei
                 # genehmigten Prämien-Einlösungen wieder abgebucht - nur
                 # relevant, wenn das Prämien-System aktiviert ist
+            ...
+        },
+        "bonus_codes": {
+            "<code_id>": {
+                "id": "<code_id>",
+                "code": "<geheimer Token>",  # steckt im QR-Link
+                "points": 10,  # Extrapunkte aufs Punktekonto
+                "note": "Danke fürs Helfen",
+                "created_at": "...",
+                "redeemed_by": None oder user_id,
+                "redeemed_at": None oder "...",
+            },
             ...
         },
         "points_history": [
@@ -231,6 +249,7 @@ class AufgabenScoreboardManager:
             "wins": {},
             "points_account": {},
             "points_history": [],
+            "bonus_codes": {},
             "rewards": {},
             "redemptions": [],
         }
@@ -261,6 +280,7 @@ class AufgabenScoreboardManager:
             self._data["wins"] = gespeicherte_daten.get("wins", {})
             self._data["points_account"] = gespeicherte_daten.get("points_account", {})
             self._data["points_history"] = gespeicherte_daten.get("points_history", [])
+            self._data["bonus_codes"] = gespeicherte_daten.get("bonus_codes", {})
             self._data["rewards"] = gespeicherte_daten.get("rewards", {})
             self._data["redemptions"] = gespeicherte_daten.get("redemptions", [])
 
@@ -285,6 +305,12 @@ class AufgabenScoreboardManager:
         # den betreffenden Eintrag nicht sicher identifizieren.
         for eintrag in self._data["completions"]:
             eintrag.setdefault("completion_id", uuid.uuid4().hex)
+            # Ältere Einträge kennen die Vorlage noch nicht - falls die
+            # Aufgabe noch existiert, nachtragen (für den Zeitplan "ab
+            # letzter Erledigung").
+            if "template_id" not in eintrag:
+                alte_aufgabe = self._data["tasks"].get(eintrag.get("task_id"))
+                eintrag["template_id"] = alte_aufgabe.get("template_id") if alte_aufgabe else None
 
         # Abwärtskompatibilität: Standardaufgaben, die vor Einführung des
         # Zeitplan-Triggers angelegt wurden, haben die neuen Felder noch
@@ -298,6 +324,7 @@ class AufgabenScoreboardManager:
             vorlage.setdefault("schedule_weekday", None)
             vorlage.setdefault("schedule_anchor", None)
             vorlage.setdefault("schedule_last_triggered", None)
+            vorlage.setdefault("schedule_last_completed", None)
             vorlage.setdefault("trigger_from_state", None)
             vorlage.setdefault("trigger_above", None)
             vorlage.setdefault("trigger_below", None)
@@ -366,25 +393,78 @@ class AufgabenScoreboardManager:
         # _async_persist() letztlich angestoßen wird.
         self.hass.add_job(async_dispatcher_send, self.hass, SIGNAL_UPDATE)
 
+    def _alle_bekannten_user_ids(self) -> set[str]:
+        """
+        Liefert alle Benutzer-IDs, die dem Manager aus irgendeinem
+        Zusammenhang bekannt sind - der Manager kennt die vollständige
+        Liste der Home-Assistant-Benutzer selbst NICHT (das weiß nur
+        sensor.py über hass.auth), braucht sie hier aber auch nicht: Ein
+        Benutzer, der in KEINEM der durchsuchten Bereiche auftaucht, hat
+        zwangsläufig auch keine erledigten Aufgaben/Prämien-Einlösungen/
+        Punktekonto-Bewegungen - für ihn liefern die per-Benutzer-Getter
+        unten ohnehin korrekt leere Listen, er muss also nicht separat
+        aufgeführt werden.
+
+        Durchsucht bewusst mehr als nur die drei naheliegenden Dicts
+        (scores/wins/points_account): Ein Benutzer könnte theoretisch
+        auch NUR in "completions"/"redemptions"/"points_history"
+        auftauchen (z. B. bei einer kostenlosen Prämie mit cost=0, ohne
+        je eine Aufgabe erledigt oder eine Siegerehrung gewonnen zu
+        haben) - dieser seltene Randfall wird hier mit abgedeckt, damit
+        seine (dann leere, aber vorhandene) Historie nicht fälschlich
+        unter panelDaten.benutzer fehlt.
+        """
+        return (
+            set(self._data["scores"])
+            | set(self._data["wins"])
+            | set(self._data["points_account"])
+            | {c["user_id"] for c in self._data["completions"]}
+            | {r["user_id"] for r in self._data["redemptions"]}
+            | {p["user_id"] for p in self._data["points_history"]}
+        )
+
     def _panel_daten_snapshot(self) -> dict[str, Any]:
         """
         Baut die vollständige "Panel-Daten"-Struktur, die als JSON-Datei
         geschrieben wird (siehe _async_schreibe_panel_daten()). Enthält
         genau die Listen, die früher als Sensor-Attribute exponiert
         wurden und die Home Assistants 16-KB-Grenze für Zustands-
-        attribute erreicht haben: offene/wartende Aufgaben,
-        Standardaufgaben (Vorlagen) und - sofern das Prämien-System
-        aktiviert ist, was der Manager selbst nicht weiß - IMMER
-        mitgeliefert (die Sensor-Attribut-Prüfung "praemien_aktiviert"
-        gibt es hier nicht, das Panel blendet die entsprechenden
-        Bereiche bei deaktiviertem Prämien-System selbst aus).
+        attribute erreicht (bzw. bei aktiver Nutzung absehbar erreicht)
+        haben:
+            - offene/wartende Aufgaben, Standardaufgaben (Vorlagen) und
+              Prämien (global, für alle Benutzer gemeinsam)
+            - PRO Benutzer: dessen Erledigungs-Verlauf sowie - sofern
+              das Prämien-System aktiviert ist (was der Manager selbst
+              nicht weiß, siehe unten) - dessen Prämien-Einlösungs- und
+              Punktekonto-Verlauf. Diese lagen bisher als Attribut am
+              jeweiligen Benutzer-Punkte-Sensor und liefen bei aktiver
+              Nutzung ebenfalls Gefahr, die 16-KB-Grenze zu erreichen
+              (z. B. bei vollständig ausgeschöpftem erledigte_aufgaben-
+              UND punktekonto_verlauf-UND eigene_praemien_verlauf-Limit
+              gleichzeitig).
+
+        Sowohl "praemien"/"wartende_praemien" (global) als auch die
+        beiden Prämien-Verlaufslisten pro Benutzer werden IMMER
+        mitgeliefert, unabhängig davon, ob das Prämien-System aktiviert
+        ist - die Prüfung "praemien_aktiviert" gibt es auf Manager-Ebene
+        nicht, das Panel blendet die entsprechenden Bereiche bei
+        deaktiviertem Prämien-System selbst aus.
         """
+        benutzer_daten = {}
+        for user_id in self._alle_bekannten_user_ids():
+            benutzer_daten[user_id] = {
+                "erledigte_aufgaben": self.get_completed_tasks_for_user(user_id),
+                "eigene_praemien_verlauf": self.get_redemptions_for_user(user_id),
+                "punktekonto_verlauf": self.get_points_history_for_user(user_id),
+            }
+
         return {
             "offene_aufgaben": self.get_all_open_tasks(),
             "wartende_aufgaben": self.get_all_pending_tasks(),
             "vorlagen": self.get_all_templates(),
             "praemien": self.get_all_rewards(),
             "wartende_praemien": self.get_pending_redemptions(),
+            "benutzer": benutzer_daten,
         }
 
     async def _async_schreibe_panel_daten(self) -> None:
@@ -685,8 +765,10 @@ class AufgabenScoreboardManager:
                 "user_id": user_id,
                 "score": punkte,
                 "completed_at": _jetzt_iso(),
+                "template_id": aufgabe.get("template_id"),
             }
         )
+        self._merke_letzte_erledigung(aufgabe.get("template_id"))
 
         await self._async_persist()
         self.hass.add_job(
@@ -803,16 +885,22 @@ class AufgabenScoreboardManager:
 
         user_id = eintrag["user_id"]
         punkte = eintrag["score"]
+        # Bei einem gedeckelten Punktabzug ("applied_score") nur den
+        # tatsächlich abgezogenen Betrag zurückgeben; ältere Einträge ohne
+        # dieses Feld verhalten sich wie bisher.
+        wirksame_punkte = eintrag.get("applied_score", punkte)
         aktueller_stand = self._data["scores"].get(user_id, 0)
         # Nicht unter 0 fallen - falls der Punktestand zwischenzeitlich
         # z. B. durch reset_score bereits auf 0 gesetzt wurde.
-        self._data["scores"][user_id] = max(0, aktueller_stand - punkte)
+        self._data["scores"][user_id] = max(0, aktueller_stand - wirksame_punkte)
 
         # Ursprüngliche Aufgabe wieder öffnen, sofern sie noch existiert
         # (wurde sie inzwischen gelöscht, bleibt nur die Punktekorrektur).
         aufgabe = self._data["tasks"].get(eintrag["task_id"])
         if aufgabe is not None and aufgabe["status"] == TASK_STATUS_DONE:
             aufgabe["status"] = TASK_STATUS_OPEN
+        # Zeitplan-Referenz ("ab letzter Erledigung") neu bestimmen.
+        self._merke_letzte_erledigung(eintrag.get("template_id"))
 
         await self._async_persist()
         self.hass.add_job(
@@ -866,7 +954,11 @@ class AufgabenScoreboardManager:
         Punktestand abzieht).
         """
         aktueller_stand = self._data["scores"].get(user_id, 0)
-        self._data["scores"][user_id] = max(0, aktueller_stand - int(amount))
+        # Tatsächlich abgezogen werden kann höchstens der aktuelle Stand
+        # (nie unter 0). Dieser Betrag wird für die Rücknahme gemerkt,
+        # damit "Rückgängig" nicht mehr zurückgibt, als abgezogen wurde.
+        tatsaechlich_abgezogen = min(int(amount), max(0, aktueller_stand))
+        self._data["scores"][user_id] = aktueller_stand - tatsaechlich_abgezogen
         self._data["completions"].append(
             {
                 "completion_id": uuid.uuid4().hex,
@@ -874,6 +966,7 @@ class AufgabenScoreboardManager:
                 "task_name": f"Abzug: {reason}" if reason else "Manueller Punktabzug",
                 "user_id": user_id,
                 "score": -int(amount),
+                "applied_score": -tatsaechlich_abgezogen,
                 "completed_at": _jetzt_iso(),
             }
         )
@@ -884,6 +977,92 @@ class AufgabenScoreboardManager:
             {"user_id": user_id, "amount": amount, "reason": reason},
         )
         _LOGGER.info("Benutzer '%s' wurden manuell %s Punkte abgezogen (Grund: %s).", user_id, amount, reason)
+
+
+    # ------------------------------------------------------------------
+    # Extrapunkte-Codes (einmalig einlösbar, z. B. als QR-Code)
+    # ------------------------------------------------------------------
+    #
+    # WICHTIG: Die Codes stehen bewusst NICHT in der Panel-Daten-Datei
+    # (config/www/..., ohne Anmeldung abrufbar) und nicht in
+    # Sensor-Attributen, sondern nur im geschützten Storage. Admins
+    # lesen sie über den Service "list_bonus_codes" (mit Antwort).
+
+    def list_bonus_codes(self) -> list[dict[str, Any]]:
+        """Alle Codes, neueste zuerst (offene und eingelöste)."""
+        return sorted(
+            (copy.deepcopy(c) for c in self._data["bonus_codes"].values()),
+            key=lambda c: c["created_at"],
+            reverse=True,
+        )
+
+    async def async_create_bonus_code(self, points: int, note: str = "") -> dict[str, Any]:
+        """Erzeugt einen neuen, einmalig einlösbaren Code."""
+        code_id = uuid.uuid4().hex
+        eintrag = {
+            "id": code_id,
+            "code": secrets.token_urlsafe(18),
+            "points": int(points),
+            "note": (note or "").strip(),
+            "created_at": _jetzt_iso(),
+            "redeemed_by": None,
+            "redeemed_at": None,
+        }
+        self._data["bonus_codes"][code_id] = eintrag
+        await self._async_persist()
+        _LOGGER.info("Extrapunkte-Code über %s Punkte angelegt.", eintrag["points"])
+        return copy.deepcopy(eintrag)
+
+    async def async_remove_bonus_code(self, code_id: str) -> bool:
+        """Löscht einen Code (offen oder eingelöst)."""
+        if self._data["bonus_codes"].pop(code_id, None) is None:
+            return False
+        await self._async_persist()
+        return True
+
+    async def async_redeem_bonus_code(self, code: str, user_id: str) -> dict[str, Any]:
+        """
+        Löst einen Code ein: schreibt dem Benutzer die Punkte auf das
+        Punktekonto gut (Verlauf-Eintrag "Extrapunkte: <Notiz>").
+        Der Code ist danach verbraucht.
+
+        :return: {"ok": bool, "points": int, "note": str, "reason": str}
+            - reason (nur bei ok=False): "unbekannt" | "bereits_eingeloest"
+        """
+        eintrag = next(
+            (
+                c
+                for c in self._data["bonus_codes"].values()
+                if secrets.compare_digest(str(c["code"]), str(code))
+            ),
+            None,
+        )
+        if eintrag is None:
+            return {"ok": False, "reason": "unbekannt"}
+        if eintrag["redeemed_by"]:
+            return {"ok": False, "reason": "bereits_eingeloest"}
+
+        jetzt = _jetzt_iso()
+        eintrag["redeemed_by"] = user_id
+        eintrag["redeemed_at"] = jetzt
+        self._data["points_account"][user_id] = self._data["points_account"].get(user_id, 0) + eintrag["points"]
+        self._data["points_history"].append(
+            {
+                "id": uuid.uuid4().hex,
+                "user_id": user_id,
+                "amount": eintrag["points"],
+                "reason": f"Extrapunkte: {eintrag['note']}" if eintrag["note"] else "Extrapunkte",
+                "timestamp": jetzt,
+            }
+        )
+        await self._async_persist()
+        self.hass.add_job(
+            self.hass.bus.async_fire,
+            EVENT_BONUS_CODE_REDEEMED,
+            {"code_id": eintrag["id"], "user_id": user_id, "points": eintrag["points"], "note": eintrag["note"]},
+        )
+        _LOGGER.info("Extrapunkte-Code (%s Punkte) von Benutzer '%s' eingelöst.", eintrag["points"], user_id)
+        return {"ok": True, "points": eintrag["points"], "note": eintrag["note"]}
 
     # ------------------------------------------------------------------
     # Siegerehrung
@@ -1383,6 +1562,7 @@ class AufgabenScoreboardManager:
             else None,
             "schedule_anchor": _heute_iso() if schedule_type else None,
             "schedule_last_triggered": None,
+            "schedule_last_completed": None,
             "due_in_days": int(due_in_days) if due_in_days else None,
             "reminder_days": int(reminder_days) if reminder_days else None,
             "created_at": _jetzt_iso(),
@@ -1470,6 +1650,7 @@ class AufgabenScoreboardManager:
                 vorlage["schedule_weekday"] = None
                 vorlage["schedule_anchor"] = None
                 vorlage["schedule_last_triggered"] = None
+                vorlage["schedule_last_completed"] = None
             else:
                 neuer_interval = (
                     int(schedule_interval)
@@ -1495,6 +1676,7 @@ class AufgabenScoreboardManager:
                     # Tage" auf "alle 3 Tage").
                     vorlage["schedule_anchor"] = _heute_iso()
                     vorlage["schedule_last_triggered"] = None
+                    vorlage["schedule_last_completed"] = None
 
         await self._async_persist()
         self.hass.add_job(self.hass.bus.async_fire, EVENT_TEMPLATE_UPDATED, {"template_id": template_id})
@@ -1574,6 +1756,24 @@ class AufgabenScoreboardManager:
             "%s Aufgabe(n) aus Standardaufgabe '%s' angelegt.", len(erzeugte_ids), vorlage.get("name")
         )
         return erzeugte_ids
+
+    def _merke_letzte_erledigung(self, template_id: str | None) -> None:
+        """
+        Setzt schedule_last_completed der Vorlage auf das Datum der
+        jüngsten freigegebenen Erledigung einer aus ihr erzeugten Aufgabe
+        (None, wenn es keine mehr gibt - z. B. nach Rücknahme). Die
+        Zeitplan-Art "days" zählt ihr Intervall ab diesem Datum.
+        Der Aufrufer ist für das Speichern zuständig.
+        """
+        vorlage = self._data["templates"].get(template_id) if template_id else None
+        if vorlage is None:
+            return
+        daten = [
+            c["completed_at"][:10]
+            for c in self._data["completions"]
+            if c.get("template_id") == template_id and c.get("completed_at")
+        ]
+        vorlage["schedule_last_completed"] = max(daten) if daten else None
 
     def _template_has_open_tasks(self, template_id: str) -> bool:
         """
@@ -1854,8 +2054,10 @@ class AufgabenScoreboardManager:
         Prüft, ob der Zeitplan einer Vorlage auf das übergebene Datum
         zutrifft.
 
-        - "days": zutreffend, wenn die Anzahl Tage seit schedule_anchor
-          ein ganzzahliges Vielfaches von schedule_interval ist.
+        - "days": zutreffend, wenn seit der letzten Erledigung
+          (schedule_last_completed, ersatzweise der letzten Anlage
+          schedule_last_triggered) mindestens schedule_interval Tage
+          vergangen sind; bei der allerersten Anlage am schedule_anchor.
         - "weekly": zutreffend, wenn heute der konfigurierte Wochentag
           ist UND die Anzahl KALENDERWOCHEN seit der Woche von
           schedule_anchor ein ganzzahliges Vielfaches von
@@ -1873,7 +2075,16 @@ class AufgabenScoreboardManager:
             return False
 
         if schedule_type == SCHEDULE_TYPE_DAYS:
-            return (heute - anchor).days % intervall == 0
+            # Das Intervall zählt ab der letzten Erledigung (bzw. ab der
+            # letzten Anlage, falls die Aufgabe ohne Erledigung gelöscht
+            # wurde). Noch keine Erledigung/Anlage: erste Anlage am Anchor.
+            referenz = max(
+                (d for d in (vorlage.get("schedule_last_completed"), vorlage.get("schedule_last_triggered")) if d),
+                default=None,
+            )
+            if referenz is None:
+                return (heute - anchor).days >= 0
+            return (heute - date.fromisoformat(referenz)).days >= intervall
 
         if schedule_type == SCHEDULE_TYPE_WEEKLY:
             ziel_wochentag = vorlage.get("schedule_weekday")
