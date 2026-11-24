@@ -56,6 +56,14 @@ class AufgabenScoreboardPanel extends HTMLElement {
     // (siehe _render() - fällt automatisch auf "benutzer" zurück,
     // falls der aktive Tab für die aktuellen Rechte nicht existiert).
     this._aktiverTab = "benutzer";
+    // Extrapunkte-Codes (nur Admin, kommen per Service-Antwort, NICHT aus
+    // daten.json - die Datei ist ohne Anmeldung abrufbar).
+    this._bonusCodes = null; // null = noch nicht geladen
+    this._bonusEntwurf = { points: 10, note: "" };
+    this._bonusQrCodeId = null; // Code, dessen QR gerade angezeigt wird
+    this._bonusMeldung = null; // Ergebnis-Banner nach dem Einlösen {typ, text}
+    this._bonusEinloesungGestartet = false;
+    this._qrLibPromise = null;
     // Merkt sich, für welchen Benutzer (falls überhaupt) das ⋮-Aktions-
     // Menü in der Rangliste gerade offen ist (Zurücksetzen-Buttons) -
     // null = keins offen. Immer nur eins gleichzeitig, hält die Zeilen
@@ -86,6 +94,11 @@ class AufgabenScoreboardPanel extends HTMLElement {
     // neuen fetch()-Aufruf rechtfertigt. Startwert null markiert "noch
     // nie geladen" - erzwingt den allerersten Abruf beim Start.
     this._letzteZaehlerSignatur = null;
+    // Fortlaufender Zähler, der die "Aktualität" einer laufenden
+    // fetch()-Anfrage markiert (siehe _aktualisierePanelDaten() für
+    // den Hintergrund: schützt vor einer Race Condition bei mehreren,
+    // schnell aufeinanderfolgenden Anfragen).
+    this._panelDatenAnfrageZaehler = 0;
     // Merkt sich einen "Fingerabdruck" der zuletzt gerenderten, für uns
     // relevanten Daten. Home Assistant ruft den hass-Setter bei JEDER
     // Zustandsänderung im gesamten System auf (also z. B. auch, wenn
@@ -113,6 +126,8 @@ class AufgabenScoreboardPanel extends HTMLElement {
    */
   set hass(hass) {
     this._hass = hass;
+    this._bonusCodeAusUrlEinloesen();
+    this._bonusEventAbonnieren();
     const signatur = this._berechneSignatur(hass);
     const zaehlerSignatur = this._berechneZaehlerSignatur(hass);
     const zaehlerHatSichGeaendert = zaehlerSignatur !== this._letzteZaehlerSignatur;
@@ -145,20 +160,65 @@ class AufgabenScoreboardPanel extends HTMLElement {
    * ersten Abruf aggressiv zwischenspeichern und spätere Änderungen
    * (neue Aufgabe, Freigabe, ...) nicht mehr bemerken, obwohl der
    * Zähler-Sensor sich korrekt geändert hat.
+   *
+   * WICHTIG - Schutz vor "Race Condition" bei mehreren, schnell
+   * aufeinanderfolgenden Aufrufen: Ändern sich kurz hintereinander
+   * mehrere Zähler-Sensoren (z. B. weil eine einzelne Aktion wie
+   * "Aufgabe erledigen" mehrere Datenänderungen auf einmal auslöst),
+   * kann set hass() mehrfach kurz hintereinander einen neuen fetch()
+   * anstoßen. Bei einer etwas langsameren oder schwankenden
+   * Netzwerkverbindung können die Antworten dieser parallel
+   * laufenden Anfragen in der FALSCHEN Reihenfolge zurückkommen - eine
+   * ältere, aber später eintreffende Antwort würde sonst die bereits
+   * aktuelleren Daten wieder überschreiben, und das Panel bliebe auf
+   * einem veralteten Stand hängen (typisches Symptom: "hilft erst nach
+   * Neustart der App", weil ein kompletter Neustart die Anfrage-Kette
+   * neu beginnt). Der Zähler "_panelDatenAnfrageZaehler" markiert bei
+   * jedem Aufruf eindeutig, welche Anfrage die ZULETZT gestartete war -
+   * eine Antwort wird nur noch übernommen, wenn zum Zeitpunkt ihres
+   * Eintreffens keine NEUERE Anfrage bereits unterwegs ist.
+   * WICHTIG - zusätzlicher Cache-Busting-Parameter in der URL: Die
+   * Home-Assistant-Companion-App (auf Android/iOS) registriert für ihre
+   * PWA-/Offline-Fähigkeit einen Service Worker, der Netzwerk-Anfragen
+   * abfangen und NACH EIGENEN Regeln aus einem eigenen Cache
+   * beantworten kann - diese Cache-Ebene liegt OBERHALB der normalen
+   * fetch()-Cache-Steuerung und ignoriert "cache: no-store" ggf.
+   * vollständig, wenn ihre eigene Caching-Strategie eine gespeicherte
+   * Antwort für dieselbe URL für "noch gültig" hält. Ein zusätzlicher,
+   * bei jedem Aufruf einmaliger Zeitstempel als Query-Parameter sorgt
+   * dafür, dass JEDE Anfrage eine für den Service Worker NEUE,
+   * unbekannte URL ist und deshalb zuverlässig an das eigentliche
+   * Netzwerk (und damit an die stets aktuelle Datei) weitergereicht
+   * wird, unabhängig von dessen Caching-Strategie.
    */
   async _aktualisierePanelDaten() {
+    const eigeneAnfrageId = ++this._panelDatenAnfrageZaehler;
+    let neueDaten = null;
     try {
-      const antwort = await fetch("/local/aufgaben_scoreboard/daten.json", { cache: "no-store" });
+      const antwort = await fetch(`/local/aufgaben_scoreboard/daten.json?t=${Date.now()}`, {
+        cache: "no-store",
+      });
       if (!antwort.ok) {
         throw new Error(`HTTP ${antwort.status}`);
       }
-      this._panelDaten = await antwort.json();
+      neueDaten = await antwort.json();
     } catch (fehler) {
       // Bewusst NICHT this._panelDaten zurücksetzen - die zuletzt
       // erfolgreich geladenen (ggf. leicht veralteten) Daten weiter
       // anzuzeigen ist besser, als das Panel bei einem einzelnen
       // fehlgeschlagenen Abruf komplett zu leeren.
       console.error("Aufgaben-Scoreboard: Panel-Daten konnten nicht geladen werden.", fehler);
+    }
+
+    if (eigeneAnfrageId !== this._panelDatenAnfrageZaehler) {
+      // Inzwischen wurde eine NEUERE Anfrage gestartet (siehe oben) -
+      // dieses jetzt veraltete Ergebnis wird bewusst verworfen, um es
+      // nicht über bereits aktuellere Daten zu schreiben.
+      return;
+    }
+
+    if (neueDaten !== null) {
+      this._panelDaten = neueDaten;
     }
     this._render();
   }
@@ -254,7 +314,12 @@ class AufgabenScoreboardPanel extends HTMLElement {
     for (const entityId in states) {
       if (!entityId.startsWith("sensor.")) continue;
       const zustand = states[entityId];
-      if (zustand.attributes && zustand.attributes.user_id && Array.isArray(zustand.attributes.offene_aufgaben)) {
+      // "user_id" allein reicht als Erkennungsmerkmal - "offene_aufgaben"
+      // stand früher zusätzlich als Attribut hier zur Verfügung, wurde
+      // aber entfernt (siehe Docstring von BenutzerPunkteSensor in
+      // sensor.py: diese Liste kommt jetzt aus panelDaten, gefiltert
+      // nach user_id, statt dupliziert pro Benutzer gespeichert zu sein).
+      if (zustand.attributes && zustand.attributes.user_id) {
         ergebnis.push({ entityId, zustand });
       }
     }
@@ -281,6 +346,92 @@ class AufgabenScoreboardPanel extends HTMLElement {
       }
     }
     return false;
+  }
+
+  /**
+   * Prüft, ob ein Benutzer aktuell über den Options-Flow ("Berücksichtigte
+   * Benutzer konfigurieren") zugelassen ist - liest dafür das
+   * "aufgaben_scoreboard_erlaubte_benutzer"-Attribut vom "offene
+   * Aufgaben"-Zähler-Sensor (siehe sensor.py, AlleOffenenAufgabenSensor).
+   * null (Liste nie konfiguriert) bedeutet "alle Benutzer zugelassen".
+   *
+   * Ergänzt die serverseitige Ablehnung in __init__.py
+   * (_ist_benutzer_zugelassen()) um eine entsprechende Anzeige im Panel
+   * selbst: Ohne diese Prüfung sah ein aus der Auswahl entfernter
+   * Benutzer weiterhin ganz normal seine offenen Aufgaben samt
+   * "Erledigt"-Button - der Klick darauf wurde zwar serverseitig
+   * abgelehnt, aber ohne jede sichtbare Rückmeldung im Panel.
+   */
+  _istBenutzerZugelassen(userId) {
+    if (!this._hass) return true;
+    const states = this._hass.states;
+    for (const entityId in states) {
+      if (
+        entityId.startsWith("sensor.") &&
+        states[entityId].attributes &&
+        states[entityId].attributes.aufgaben_scoreboard_sensor_kind === "offene_aufgaben"
+      ) {
+        const erlaubte = states[entityId].attributes.aufgaben_scoreboard_erlaubte_benutzer;
+        return erlaubte === null || erlaubte === undefined || erlaubte.includes(userId);
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Schlüssel, unter dem im localStorage des Browsers gemerkt wird, dass
+   * ein Benutzer den "nicht mehr zugelassen"-Hinweis bereits mit
+   * "Verstanden" bestätigt hat. Bewusst pro Benutzer UND fest an diese
+   * Integration gebunden (Präfix) - unabhängig von anderen im selben
+   * Browser genutzten Diensten.
+   */
+  _hinweisGesehenSchluessel(userId) {
+    return `aufgaben_scoreboard_nicht_zugelassen_gesehen_${userId}`;
+  }
+
+  /**
+   * Prüft, ob der Benutzer den Hinweis bereits bestätigt hat. Nutzt
+   * bewusst try/catch: localStorage kann in seltenen Fällen (z. B.
+   * private Browsing-Modi mancher Browser, deaktivierte Website-Daten)
+   * einen Fehler werfen statt einfach nichts zurückzugeben - in diesem
+   * Fall wird der Hinweis sicherheitshalber IMMER angezeigt (fail-safe),
+   * statt das Panel komplett abstürzen zu lassen.
+   */
+  _hinweisBereitsGesehen(userId) {
+    try {
+      return localStorage.getItem(this._hinweisGesehenSchluessel(userId)) === "true";
+    } catch (fehler) {
+      return false;
+    }
+  }
+
+  /**
+   * Merkt sich dauerhaft (bis zum Zurücksetzen, siehe
+   * _hinweisZuruecksetzenFallsZugelassen()), dass der Hinweis bestätigt
+   * wurde.
+   */
+  _hinweisAlsGesehenMarkieren(userId) {
+    try {
+      localStorage.setItem(this._hinweisGesehenSchluessel(userId), "true");
+    } catch (fehler) {
+      // Siehe _hinweisBereitsGesehen() - wird bewusst ignoriert.
+    }
+  }
+
+  /**
+   * Setzt die Bestätigung automatisch zurück, SOBALD der Benutzer
+   * wieder zugelassen ist - so erscheint der Hinweis bei einer
+   * künftigen erneuten Entfernung wieder frisch, statt dauerhaft
+   * unterdrückt zu bleiben. Wird bei JEDEM Render aufgerufen, solange
+   * der Benutzer zugelassen ist (siehe _render()) - kostet nichts,
+   * schadet nichts, falls ohnehin schon zurückgesetzt.
+   */
+  _hinweisZuruecksetzenFallsZugelassen(userId) {
+    try {
+      localStorage.removeItem(this._hinweisGesehenSchluessel(userId));
+    } catch (fehler) {
+      // Siehe _hinweisBereitsGesehen() - wird bewusst ignoriert.
+    }
   }
 
   // -----------------------------------------------------------------
@@ -350,6 +501,250 @@ class AufgabenScoreboardPanel extends HTMLElement {
 
   _einloesungAblehnen(redemptionId) {
     this._hass.callService("aufgaben_scoreboard", "reject_redemption", { redemption_id: redemptionId });
+  }
+
+  /** Ruft einen Service MIT Antwort auf und gibt dessen response zurück. */
+  async _serviceMitAntwort(service, daten = {}) {
+    const ergebnis = await this._hass.callWS({
+      type: "call_service",
+      domain: "aufgaben_scoreboard",
+      service,
+      service_data: daten,
+      return_response: true,
+    });
+    return ergebnis && ergebnis.response ? ergebnis.response : {};
+  }
+
+  /**
+   * Abonniert (nur Admin, einmalig) das Event "Code eingelöst", damit die
+   * Codeliste sich sofort aktualisiert, ohne dass das Panel verlassen
+   * werden muss. Die Codes selbst stehen bewusst nicht in einem Sensor
+   * oder in daten.json - ohne dieses Event gäbe es keinen Auslöser.
+   */
+  _bonusEventAbonnieren() {
+    if (this._bonusAbo || !this._istAdmin() || !this._hass.connection) return;
+    this._bonusAbo = this._hass.connection
+      .subscribeEvents(() => {
+        if (this._bonusLaedt) {
+          this._bonusNochmalLaden = true;
+        } else {
+          this._bonusCodesLaden();
+        }
+      }, "aufgaben_scoreboard_bonus_code_redeemed")
+      .catch((fehler) => {
+        console.error("Aufgaben-Scoreboard: Event-Abo fehlgeschlagen.", fehler);
+        this._bonusAbo = null;
+      });
+  }
+
+  disconnectedCallback() {
+    if (this._bonusAbo) {
+      this._bonusAbo.then((abbestellen) => abbestellen && abbestellen()).catch(() => {});
+      this._bonusAbo = null;
+    }
+  }
+
+  async _bonusCodesLaden() {
+    if (!this._istAdmin() || this._bonusLaedt) return;
+    this._bonusLaedt = true;
+    try {
+      const antwort = await this._serviceMitAntwort("list_bonus_codes");
+      this._bonusCodes = antwort.codes || [];
+    } catch (fehler) {
+      console.error("Aufgaben-Scoreboard: Extrapunkte-Codes konnten nicht geladen werden.", fehler);
+      this._bonusCodes = this._bonusCodes || [];
+    }
+    this._bonusLaedt = false;
+    this._render();
+    if (this._bonusNochmalLaden) {
+      this._bonusNochmalLaden = false;
+      this._bonusCodesLaden();
+    }
+  }
+
+  async _bonusCodeErzeugen(punkte, notiz) {
+    try {
+      const code = await this._serviceMitAntwort("create_bonus_code", { amount: punkte, note: notiz });
+      this._bonusQrCodeId = code.id || null;
+    } catch (fehler) {
+      console.error("Aufgaben-Scoreboard: Code konnte nicht erzeugt werden.", fehler);
+      alert("Der Code konnte nicht erzeugt werden.");
+      return;
+    }
+    this._bonusLaedt = false;
+    await this._bonusCodesLaden();
+  }
+
+  async _bonusCodeLoeschen(codeId) {
+    await this._hass.callService("aufgaben_scoreboard", "remove_bonus_code", { code_id: codeId });
+    if (this._bonusQrCodeId === codeId) this._bonusQrCodeId = null;
+    this._bonusLaedt = false;
+    await this._bonusCodesLaden();
+  }
+
+  /**
+   * Löst einen per QR-Link übergebenen Code (?bonus=...) für den
+   * angemeldeten Benutzer ein - genau einmal pro Seitenaufruf - und
+   * entfernt den Parameter anschließend aus der Adresszeile, damit ein
+   * Neuladen den (dann ohnehin verbrauchten) Code nicht erneut sendet.
+   */
+  async _bonusCodeAusUrlEinloesen() {
+    if (this._bonusEinloesungGestartet || !this._hass || !this._hass.user) return;
+    let code = null;
+    try {
+      code = new URLSearchParams(window.location.search).get("bonus");
+    } catch (fehler) {
+      return;
+    }
+    if (!code) return;
+    this._bonusEinloesungGestartet = true;
+    try {
+      const url = new URL(window.location.href);
+      url.searchParams.delete("bonus");
+      window.history.replaceState(null, "", url.pathname + url.search + url.hash);
+    } catch (fehler) {
+      // Adresszeile nicht änderbar - unkritisch.
+    }
+    const gruende = {
+      unbekannt: "Dieser Code ist ungültig.",
+      bereits_eingeloest: "Dieser Code wurde bereits eingelöst.",
+      nicht_zugelassen: "Du nimmst aktuell nicht teil und kannst keine Extrapunkte einlösen.",
+      praemien_deaktiviert: "Das Prämien-System ist nicht aktiviert.",
+      kein_benutzer: "Es konnte kein Benutzer ermittelt werden.",
+    };
+    try {
+      const antwort = await this._serviceMitAntwort("redeem_bonus_code", { code });
+      if (antwort.ok) {
+        this._bonusMeldung = {
+          typ: "ok",
+          text: `🎉 ${antwort.points} Extrapunkte gutgeschrieben${antwort.note ? ` (${antwort.note})` : ""} – sie liegen auf deinem Punktekonto.`,
+        };
+      } else {
+        this._bonusMeldung = { typ: "fehler", text: gruende[antwort.reason] || "Der Code konnte nicht eingelöst werden." };
+      }
+    } catch (fehler) {
+      console.error("Aufgaben-Scoreboard: Einlösen des Codes fehlgeschlagen.", fehler);
+      this._bonusMeldung = { typ: "fehler", text: "Der Code konnte nicht eingelöst werden." };
+    }
+    this._render();
+  }
+
+  /** Lädt die mitgelieferte QR-Bibliothek (qrcode.js) genau einmal. */
+  _qrBibliothekLaden() {
+    if (window.qrcode) return Promise.resolve(window.qrcode);
+    if (!this._qrLibPromise) {
+      this._qrLibPromise = new Promise((resolve, reject) => {
+        const skript = document.createElement("script");
+        skript.src = "/aufgaben_scoreboard_frontend/qrcode.js?v=2.2.0";
+        skript.onload = () => (window.qrcode ? resolve(window.qrcode) : reject(new Error("qrcode fehlt")));
+        skript.onerror = () => reject(new Error("qrcode.js nicht ladbar"));
+        document.head.appendChild(skript);
+      }).catch((fehler) => {
+        this._qrLibPromise = null;
+        throw fehler;
+      });
+    }
+    return this._qrLibPromise;
+  }
+
+  _bonusLink(code) {
+    return `${window.location.origin}/aufgaben-scoreboard?bonus=${encodeURIComponent(code)}`;
+  }
+
+  _bonusQrZeichnen() {
+    const ziel = this.shadowRoot.querySelector(".bonus-qr[data-code]");
+    if (!ziel) return;
+    const link = this._bonusLink(ziel.getAttribute("data-code"));
+    this._qrBibliothekLaden()
+      .then((qrcode) => {
+        const qr = qrcode(0, "M");
+        qr.addData(link);
+        qr.make();
+        ziel.innerHTML = qr.createSvgTag({ cellSize: 4, margin: 4, scalable: true });
+      })
+      .catch(() => {
+        ziel.textContent = "QR-Code konnte nicht erzeugt werden – bitte den Link darunter verwenden.";
+      });
+  }
+
+  _renderBonusMeldung() {
+    if (!this._bonusMeldung) return "";
+    const ok = this._bonusMeldung.typ === "ok";
+    return `
+      <div class="abschnitt bonus-meldung ${ok ? "bonus-ok" : "bonus-fehler"}">
+        <span>${this._escape(this._bonusMeldung.text)}</span>
+        <button class="btn-secondary" id="bonus-meldung-schliessen">OK</button>
+      </div>`;
+  }
+
+  _renderBonusCodesBereich(praemienAktiviert) {
+    if (!praemienAktiviert) return "";
+    const codes = this._bonusCodes;
+    // _nameFuerUserId() liefert den Namen bereits HTML-escaped.
+    const benutzerName = (userId) => this._nameFuerUserId(userId, this._sammleBenutzerSensoren());
+    const aktiverCode = codes && this._bonusQrCodeId ? codes.find((c) => c.id === this._bonusQrCodeId) : null;
+
+    return `
+      <div class="abschnitt admin-bereich">
+        <div class="admin-kopf"><h2>🎟️ Extrapunkte-Codes</h2></div>
+        <div class="hinweis-klein">
+          Einmalig einlösbarer QR-Code: Wer ihn scannt (angemeldet in Home
+          Assistant), bekommt die Punkte aufs Punktekonto. Der Link nutzt
+          die Adresse, unter der du dieses Panel gerade geöffnet hast.
+        </div>
+        <form class="bonus-formular" id="bonus-code-formular">
+          <label>Punkte
+            <input type="number" name="points" min="1" required value="${this._escape(String(this._bonusEntwurf.points))}" />
+          </label>
+          <label>Notiz (optional)
+            <input type="text" name="note" placeholder="z. B. Danke fürs Helfen" value="${this._escape(this._bonusEntwurf.note)}" />
+          </label>
+          <button type="submit" class="btn-primary">QR-Code erzeugen</button>
+        </form>
+
+        ${
+          aktiverCode
+            ? `
+          <div class="bonus-qr-box">
+            <div class="bonus-qr" data-code="${this._escape(aktiverCode.code)}">QR wird erzeugt …</div>
+            <div><b>${aktiverCode.points} Punkte</b>${aktiverCode.note ? ` – ${this._escape(aktiverCode.note)}` : ""}</div>
+            <input type="text" readonly class="bonus-link" value="${this._escape(this._bonusLink(aktiverCode.code))}" />
+            <button class="btn-secondary" id="bonus-qr-schliessen">QR ausblenden</button>
+          </div>`
+            : ""
+        }
+
+        <div class="aufgaben-liste">
+          ${
+            codes === null
+              ? `<div class="hinweis">Lade Codes …</div>`
+              : codes.length === 0
+                ? `<div class="hinweis">Noch keine Codes erzeugt.</div>`
+                : codes
+                    .map(
+                      (c) => `
+              <div class="aufgaben-karte">
+                <div class="aufgaben-info">
+                  <div class="aufgaben-name">${c.points} Punkte${c.note ? ` – ${this._escape(c.note)}` : ""}</div>
+                  <div class="aufgaben-beschreibung">${
+                    c.redeemed_by
+                      ? `✅ Eingelöst von ${benutzerName(c.redeemed_by)} am ${this._escape(
+                          new Date(c.redeemed_at).toLocaleString("de-DE")
+                        )}`
+                      : "🟢 Offen – noch nicht eingelöst"
+                  }</div>
+                </div>
+                <div class="aufgaben-aktion">
+                  ${c.redeemed_by ? "" : `<button class="btn-secondary bonus-qr-btn" data-code-id="${c.id}">QR anzeigen</button>`}
+                  <button class="btn-danger bonus-loeschen-btn" data-code-id="${c.id}">Löschen</button>
+                </div>
+              </div>`
+                    )
+                    .join("")
+          }
+        </div>
+      </div>
+    `;
   }
 
   _aufgabeLoeschen(taskId) {
@@ -512,6 +907,10 @@ class AufgabenScoreboardPanel extends HTMLElement {
     const panelDaten = this._panelDaten;
     const praemienAktiviert = this._praemienAktiviert();
     const eigeneUserId = this._hass.user ? this._hass.user.id : null;
+    const eigeneZugelassen = eigeneUserId ? this._istBenutzerZugelassen(eigeneUserId) : true;
+    if (eigeneUserId && eigeneZugelassen) {
+      this._hinweisZuruecksetzenFallsZugelassen(eigeneUserId);
+    }
 
     // Tab-Definitionen: "benutzer" ist für ALLE sichtbar, alle
     // anderen nur für Administratoren.
@@ -539,6 +938,8 @@ class AufgabenScoreboardPanel extends HTMLElement {
           ${this._isPanel ? `<button class="menu-btn" id="menu-btn" title="Menü">☰</button>` : ""}
           <h1>🏆 Aufgaben-Punktesystem</h1>
         </div>
+
+        ${this._renderBonusMeldung()}
 
         ${
           tabs.length > 1
@@ -578,8 +979,8 @@ class AufgabenScoreboardPanel extends HTMLElement {
                 const userId = b.zustand.attributes.user_id;
                 const aufgeklappt = this._aufgeklappterVerlaufUserId === userId;
                 const kontoAufgeklappt = this._aufgeklappterPunktekontoUserId === userId;
-                const verlauf = b.zustand.attributes.erledigte_aufgaben || [];
-                const kontoVerlauf = b.zustand.attributes.punktekonto_verlauf || [];
+                const verlauf = (panelDaten.benutzer && panelDaten.benutzer[userId] && panelDaten.benutzer[userId].erledigte_aufgaben) || [];
+                const kontoVerlauf = (panelDaten.benutzer && panelDaten.benutzer[userId] && panelDaten.benutzer[userId].punktekonto_verlauf) || [];
                 const siege = b.zustand.attributes.siege || 0;
                 const punktekonto = b.zustand.attributes.punktekonto;
                 const menuOffen = this._offenesRangMenuUserId === userId;
@@ -644,10 +1045,10 @@ class AufgabenScoreboardPanel extends HTMLElement {
 
           <div class="abschnitt">
             <h2>Meine offenen Aufgaben</h2>
-            ${this._renderEigeneAufgaben(benutzerSensoren, eigeneUserId)}
+            ${this._renderEigeneAufgaben(eigeneUserId, panelDaten, eigeneZugelassen)}
           </div>
 
-          ${this._renderMeinPraemienBereich(benutzerSensoren, eigeneUserId, panelDaten)}
+          ${this._renderMeinPraemienBereich(benutzerSensoren, eigeneUserId, panelDaten, eigeneZugelassen)}
         `
             : ""
         }
@@ -663,6 +1064,7 @@ class AufgabenScoreboardPanel extends HTMLElement {
         ${istAdmin && this._aktiverTab === "verwaltung" ? this._renderAdminBereich(panelDaten, benutzerSensoren) : ""}
         ${istAdmin && this._aktiverTab === "vorlagen" ? this._renderVorlagenBereich(panelDaten, benutzerSensoren) : ""}
         ${istAdmin && this._aktiverTab === "praemien" ? this._renderPraemienVerwaltungBereich(panelDaten, benutzerSensoren, praemienAktiviert) : ""}
+        ${istAdmin && this._aktiverTab === "praemien" ? this._renderBonusCodesBereich(praemienAktiviert) : ""}
       </div>
     `;
 
@@ -687,12 +1089,45 @@ class AufgabenScoreboardPanel extends HTMLElement {
     // ggf. gerade wiederhergestellten Auswahlwert anpassen - siehe
     // _vorlagenZeitplanUiAktualisieren().
     this._vorlagenZeitplanUiAktualisieren();
+
+    // Extrapunkte-Codes: beim ersten Öffnen des Prämien-Tabs laden, QR zeichnen.
+    if (istAdmin && this._aktiverTab === "praemien" && praemienAktiviert) {
+      if (this._bonusCodes === null) this._bonusCodesLaden();
+      this._bonusQrZeichnen();
+    }
   }
 
-  _renderEigeneAufgaben(benutzerSensoren, eigeneUserId) {
-    const eigener = benutzerSensoren.find((b) => b.zustand.attributes.user_id === eigeneUserId);
-    const aufgaben = eigener ? eigener.zustand.attributes.offene_aufgaben : [];
-    const wartende = eigener ? eigener.zustand.attributes.wartende_aufgaben : [];
+  /**
+   * Personal offene/wartende Aufgaben werden NICHT mehr dupliziert pro
+   * Benutzer gespeichert (frühere Sensor-Attribute), sondern hier aus
+   * den bereits vorhandenen GLOBALEN Listen (panelDaten.offene_aufgaben/
+   * wartende_aufgaben) client-seitig gefiltert - exakt dieselbe Regel
+   * wie AufgabenScoreboardManager.get_open_tasks_for_user()/
+   * get_pending_tasks_for_user() im Backend: eine Aufgabe ist "offen für
+   * mich", wenn sie niemandem explizit zugewiesen ist (für alle offen)
+   * ODER mir explizit zugewiesen ist; "wartend für mich" heißt, ICH habe
+   * sie als erledigt gemeldet (pending_by).
+   */
+  _renderEigeneAufgaben(eigeneUserId, panelDaten, istZugelassen) {
+    if (!istZugelassen) {
+      if (this._hinweisBereitsGesehen(eigeneUserId)) {
+        return "";
+      }
+      return `<div class="hinweis-warnung">
+        ⚠️ Du bist aktuell nicht (mehr) in der Benutzerauswahl dieser Integration enthalten
+        und kannst deshalb keine Aufgaben erledigen. Bitte wende dich an einen Administrator.
+        <div class="hinweis-warnung-aktion">
+          <button class="btn-secondary hinweis-verstanden-btn" data-user-id="${eigeneUserId}">Verstanden</button>
+        </div>
+      </div>`;
+    }
+
+    const alleOffenen = panelDaten.offene_aufgaben || [];
+    const alleWartenden = panelDaten.wartende_aufgaben || [];
+    const aufgaben = alleOffenen.filter(
+      (a) => !a.assigned_to || a.assigned_to.length === 0 || a.assigned_to.includes(eigeneUserId)
+    );
+    const wartende = alleWartenden.filter((a) => a.pending_by === eigeneUserId);
 
     const offenListe =
       !aufgaben || aufgaben.length === 0
@@ -716,7 +1151,11 @@ class AufgabenScoreboardPanel extends HTMLElement {
             </div>
             <div class="aufgaben-aktion">
               <span class="punkte-badge">+${a.score}</span>
-              <button class="btn-primary eigene-erledigen" data-task-id="${a.id}">Erledigt</button>
+              <button
+                class="btn-primary eigene-erledigen"
+                data-task-id="${a.id}"
+                ${istZugelassen ? "" : "disabled"}
+              >Erledigt</button>
             </div>
           </div>`
           )
@@ -929,13 +1368,31 @@ class AufgabenScoreboardPanel extends HTMLElement {
    * Sensor überhaupt ein "punktekonto"-Attribut besitzt - fehlt es,
    * ist das Feature serverseitig deaktiviert, siehe sensor.py).
    */
-  _renderMeinPraemienBereich(benutzerSensoren, eigeneUserId, panelDaten) {
+  _renderMeinPraemienBereich(benutzerSensoren, eigeneUserId, panelDaten, istZugelassen) {
     const eigener = benutzerSensoren.find((b) => b.zustand.attributes.user_id === eigeneUserId);
     if (!eigener || eigener.zustand.attributes.punktekonto === undefined) {
       return "";
     }
     const guthaben = eigener.zustand.attributes.punktekonto;
     const praemien = panelDaten.praemien || [];
+
+    if (!istZugelassen) {
+      const hinweisTeil = this._hinweisBereitsGesehen(eigeneUserId)
+        ? ""
+        : `<div class="hinweis-warnung">
+            ⚠️ Du bist aktuell nicht (mehr) in der Benutzerauswahl dieser Integration enthalten
+            und kannst deshalb keine Prämien einlösen. Bitte wende dich an einen Administrator.
+            <div class="hinweis-warnung-aktion">
+              <button class="btn-secondary hinweis-verstanden-btn" data-user-id="${eigeneUserId}">Verstanden</button>
+            </div>
+          </div>`;
+      return `
+        <div class="abschnitt">
+          <h2>💰 Mein Punktekonto: ${guthaben} Punkte</h2>
+          ${hinweisTeil}
+        </div>
+      `;
+    }
 
     return `
       <div class="abschnitt">
@@ -1520,7 +1977,8 @@ class AufgabenScoreboardPanel extends HTMLElement {
               <div class="hinweis-klein">
                 Erzeugt automatisch eine neue Aufgabe nach dem gewählten
                 Zeitplan - sofern nicht bereits eine offene Aufgabe aus
-                dieser Vorlage existiert. Kann zusätzlich zum
+                dieser Vorlage existiert. Bei "Alle X Tage" zählt das
+                Intervall ab der letzten Erledigung (Freigabe). Kann zusätzlich zum
                 Entitäts-Trigger oder unabhängig davon genutzt werden.
               </div>
             </fieldset>
@@ -1830,6 +2288,13 @@ class AufgabenScoreboardPanel extends HTMLElement {
       });
     });
 
+    this.shadowRoot.querySelectorAll(".hinweis-verstanden-btn").forEach((btn) => {
+      btn.addEventListener("click", (ev) => {
+        this._hinweisAlsGesehenMarkieren(ev.target.getAttribute("data-user-id"));
+        this._render();
+      });
+    });
+
     if (!istAdmin) return;
 
     this.shadowRoot.querySelectorAll(".reset-punkte-btn").forEach((btn) => {
@@ -1984,6 +2449,48 @@ class AufgabenScoreboardPanel extends HTMLElement {
         this._render();
       });
     }
+
+    const bonusMeldungBtn = this.shadowRoot.getElementById("bonus-meldung-schliessen");
+    if (bonusMeldungBtn) {
+      bonusMeldungBtn.addEventListener("click", () => {
+        this._bonusMeldung = null;
+        this._render();
+      });
+    }
+    const bonusFormular = this.shadowRoot.getElementById("bonus-code-formular");
+    if (bonusFormular) {
+      bonusFormular.addEventListener("input", () => {
+        const d = new FormData(bonusFormular);
+        this._bonusEntwurf = { points: d.get("points") || "", note: d.get("note") || "" };
+      });
+      bonusFormular.addEventListener("submit", (ev) => {
+        ev.preventDefault();
+        const d = new FormData(bonusFormular);
+        const punkte = parseInt(d.get("points"), 10);
+        if (!punkte || punkte < 1) return;
+        this._bonusCodeErzeugen(punkte, String(d.get("note") || "").trim());
+      });
+    }
+    this.shadowRoot.querySelectorAll(".bonus-qr-btn").forEach((btn) => {
+      btn.addEventListener("click", (ev) => {
+        this._bonusQrCodeId = ev.target.getAttribute("data-code-id");
+        this._render();
+      });
+    });
+    const bonusQrSchliessen = this.shadowRoot.getElementById("bonus-qr-schliessen");
+    if (bonusQrSchliessen) {
+      bonusQrSchliessen.addEventListener("click", () => {
+        this._bonusQrCodeId = null;
+        this._render();
+      });
+    }
+    this.shadowRoot.querySelectorAll(".bonus-loeschen-btn").forEach((btn) => {
+      btn.addEventListener("click", (ev) => {
+        if (confirm("Diesen Code wirklich löschen? Ein offener Code kann danach nicht mehr eingelöst werden.")) {
+          this._bonusCodeLoeschen(ev.target.getAttribute("data-code-id"));
+        }
+      });
+    });
 
     const togglePraemienBtn = this.shadowRoot.getElementById("toggle-praemien-formular");
     if (togglePraemienBtn) {
@@ -2592,6 +3099,22 @@ class AufgabenScoreboardPanel extends HTMLElement {
         color: var(--secondary-text-color);
         padding: 12px 4px;
       }
+      .hinweis-warnung {
+        color: var(--error-color, #f44336);
+        background: rgba(var(--rgb-error-color, 244,67,54), 0.08);
+        border: 1px solid var(--error-color, #f44336);
+        border-radius: 8px;
+        padding: 10px 12px;
+        margin-bottom: 12px;
+        font-size: 0.9em;
+      }
+      .hinweis-warnung-aktion {
+        margin-top: 10px;
+      }
+      .hinweis-verstanden-btn {
+        font-size: 0.85em;
+        padding: 4px 12px;
+      }
 
       .aufgaben-liste {
         display: flex;
@@ -2736,6 +3259,16 @@ class AufgabenScoreboardPanel extends HTMLElement {
         accent-color: var(--primary-color);
         cursor: pointer;
       }
+      .bonus-formular { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-end; margin: 8px 0; }
+      .bonus-formular label { display: flex; flex-direction: column; gap: 4px; font-size: 0.85em; }
+      .bonus-formular input { padding: 8px; }
+      .bonus-qr-box { display: flex; flex-direction: column; align-items: center; gap: 8px; margin: 12px 0; padding: 12px; border: 1px dashed var(--divider-color, #ccc); border-radius: 8px; }
+      .bonus-qr { width: 240px; max-width: 100%; background: #fff; padding: 4px; border-radius: 4px; }
+      .bonus-qr svg { width: 100%; height: auto; display: block; }
+      .bonus-link { width: 100%; box-sizing: border-box; padding: 6px; font-size: 0.8em; }
+      .bonus-meldung { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 12px; border-radius: 8px; }
+      .bonus-ok { background: rgba(76, 175, 80, 0.18); }
+      .bonus-fehler { background: rgba(244, 67, 54, 0.18); }
       .hinweis-klein {
         font-size: 0.85em;
         color: var(--secondary-text-color);
